@@ -4,21 +4,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	//"html"
 	"html/template"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"regexp"
-	//	"strings"
 	"time"
 )
 
 var serverStart time.Time
 var apiClient *http.Client
 
-var templates = template.Must(template.ParseFiles("./templates/main.html"))
+var templates = template.Must(template.ParseFiles("./templates/main.html", "./templates/list.html"))
 var linksPattern = regexp.MustCompile("\\<(https\\://api\\.github\\.com/user/repos(\\?page=[0-9]+.*?))\\>; rel=\"(first|next|prev|last)\"")
 
 func init() {
@@ -50,6 +51,11 @@ type AccessToken struct {
 	Token string
 	Type  string
 	Url   string
+}
+
+type RepoSelectorData struct {
+	State        int64
+	Repositories []Project
 }
 
 type Project struct {
@@ -104,7 +110,6 @@ func GetRepositoriesPage(requestUrl string, authHeader string) []Project {
 	if exists {
 		rows = append(rows, GetRepositoriesPage(nextUrl, authHeader)...)
 	}
-	fmt.Printf("%d - ", len(rows))
 	return rows
 }
 
@@ -197,16 +202,59 @@ func callbackHandler(respWriter http.ResponseWriter, request *http.Request) {
 	}
 
 	token := AccessToken{
+		Url:   secrets.ApiUrl,
 		Token: tokenData["access_token"][0],
 		Type:  tokenData["token_type"][0],
-		Url:   secrets.ApiUrl,
 	}
-	token.GetPublicRepositories()
+	repositories := token.GetPublicRepositories()
+	err = templates.ExecuteTemplate(respWriter, "list.html", RepoSelectorData{
+		Repositories: repositories,
+		State:        time.Since(serverStart).Nanoseconds(),
+	})
+	if err != nil {
+		fmt.Printf("Error: %q\n", err)
+		http.Error(respWriter, err.Error(), http.StatusInternalServerError)
+		return
+	}
+}
+
+func GetSelectedRepos(body io.ReadCloser) ([]string, bool) {
+	bodyBytes, err := ioutil.ReadAll(body)
+	if err != nil {
+		fmt.Printf("oops")
+	}
+	data, _ := url.ParseQuery(string(bodyBytes))
+	if isStaleRequest(data["state"]) {
+		fmt.Printf("Oh noes!")
+		return nil, false
+	}
+	selectedRepos, exists := data["reposGroup"]
+	return selectedRepos, exists
+}
+
+func processRepos(selectedRepos []string) {
+	log.Println("Processing... %q\n", selectedRepos)
+}
+
+func processHandler(respWriter http.ResponseWriter, request *http.Request) {
+	if request.Method != "POST" {
+		http.Redirect(respWriter, request, "/", http.StatusMovedPermanently)
+		return
+	}
+	selectedRepos, correctlyParsed := GetSelectedRepos(request.Body)
+	if !correctlyParsed {
+		fmt.Printf("Something went wrong with parsing.")
+		return
+	}
+	go processRepos(selectedRepos)
+	http.Redirect(respWriter, request, "/", http.StatusAccepted)
+	return
 }
 
 func main() {
 	http.Handle("/vendor/", http.FileServer(http.Dir(".")))
 	http.HandleFunc("/callback", callbackHandler)
+	http.HandleFunc("/process", processHandler)
 	http.HandleFunc("/", viewHandler)
 
 	log.Println("Starting server... http://localhost:8080/")
